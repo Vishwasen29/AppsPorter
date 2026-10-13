@@ -1,0 +1,83 @@
+name: Build Moto UI module
+
+on:
+  workflow_dispatch:
+    inputs:
+      with_systemui:
+        description: "Include Moto SystemUI (lockscreen). Risky: can bootloop."
+        type: boolean
+        default: false
+      apps:
+        description: "Regex of app folder names to pull (blank = script default)"
+        type: string
+        default: ""
+      dump_ref:
+        description: "Dump branch/tag on dumps.tadiphone.dev (blank = script default)"
+        type: string
+        default: ""
+      release:
+        description: "Also publish a GitHub Release"
+        type: boolean
+        default: false
+
+permissions:
+  contents: write   # only used when 'release' is ticked
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install tools
+        run: sudo apt-get update && sudo apt-get install -y jq zip curl
+
+      - name: List matching app folders
+        env:
+          WITH_SYSTEMUI: ${{ inputs.with_systemui && '1' || '0' }}
+          APPS: ${{ inputs.apps }}
+          REF: ${{ inputs.dump_ref }}
+        run: |
+          [ -z "$APPS" ] && unset APPS
+          [ -z "$REF" ] && unset REF
+          chmod +x build_moto_launcher_v3.sh
+          ./build_moto_launcher_v3.sh list | tee matched.txt
+          [ -s matched.txt ] || { echo "::error::No app folders matched. Adjust 'apps'."; exit 1; }
+
+      - name: Build module
+        env:
+          WITH_SYSTEMUI: ${{ inputs.with_systemui && '1' || '0' }}
+          APPS: ${{ inputs.apps }}
+          REF: ${{ inputs.dump_ref }}
+        run: |
+          [ -z "$APPS" ] && unset APPS
+          [ -z "$REF" ] && unset REF
+          ./build_moto_launcher_v3.sh build
+
+      - name: Sanity-check the zip
+        run: |
+          unzip -l moto_launcher_module.zip | tee zip_contents.txt
+          grep -q 'module.prop' zip_contents.txt   || { echo "::error::module.prop missing"; exit 1; }
+          grep -q '\.apk' zip_contents.txt         || { echo "::error::No APK in zip (Git LFS pointer in dump?)"; exit 1; }
+          if grep -qE '/oat/|\.(odex|vdex)' zip_contents.txt; then
+            echo "::error::Precompiled oat files leaked into the zip"; exit 1
+          fi
+          grep -qi 'permissions/.*\.xml' zip_contents.txt || echo "::warning::No privapp-permissions XML found; a priv-app without one can bootloop"
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: moto_launcher_module
+          path: |
+            moto_launcher_module.zip
+            zip_contents.txt
+            matched.txt
+
+      - name: Publish release
+        if: ${{ inputs.release }}
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: build-${{ github.run_number }}
+          name: Moto UI module build ${{ github.run_number }}
+          files: moto_launcher_module.zip
