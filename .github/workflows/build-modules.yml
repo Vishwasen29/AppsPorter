@@ -1,0 +1,76 @@
+name: Build Moto port KernelSU modules
+
+on:
+  workflow_dispatch:
+    inputs:
+      dump_url:
+        description: Dump git URL
+        default: https://dumps.tadiphone.dev/dumps/motorola/lhotse.git
+      branch:
+        description: Dump branch (blank = default branch)
+        required: false
+        default: ""
+      modules:
+        description: Comma list of modules to build
+        default: launcher,widgets,systemui
+      expected_sdk:
+        description: Abort install if ROM SDK differs (blank = no check)
+        required: false
+        default: ""
+      sign_systemui:
+        description: Re-sign SystemUI/ClockFace with your ROM platform key (needs secrets)
+        type: boolean
+        default: false
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y aapt apksigner zipalign zip unzip binutils
+
+      - name: Sparse-fetch only the needed files from the dump
+        env:
+          DUMP_URL: ${{ inputs.dump_url }}
+          BRANCH: ${{ inputs.branch }}
+          MODULES: ${{ inputs.modules }}
+        run: |
+          chmod +x build.sh
+          ./build.sh paths "$MODULES" | sed 's#^#/#' > sparse.txt
+          git clone --filter=blob:none --no-checkout --depth 1 \
+            ${BRANCH:+--branch "$BRANCH"} "$DUMP_URL" dump
+          cd dump
+          git sparse-checkout init --no-cone
+          git sparse-checkout set --stdin < ../sparse.txt
+          git checkout
+          echo "Fetched files:"; find . -path ./.git -prune -o -type f -print | head -100
+
+      - name: Write platform key (optional)
+        if: ${{ inputs.sign_systemui }}
+        env:
+          PK8: ${{ secrets.PLATFORM_PK8_B64 }}
+          PEM: ${{ secrets.PLATFORM_X509_B64 }}
+        run: |
+          [ -n "$PK8" ] && [ -n "$PEM" ] || { echo "Missing PLATFORM_PK8_B64 / PLATFORM_X509_B64 secrets"; exit 1; }
+          mkdir -p "$RUNNER_TEMP/keys"
+          echo "$PK8" | base64 -d > "$RUNNER_TEMP/keys/platform.pk8"
+          echo "$PEM" | base64 -d > "$RUNNER_TEMP/keys/platform.x509.pem"
+          echo "PLATFORM_PK8=$RUNNER_TEMP/keys/platform.pk8" >> "$GITHUB_ENV"
+          echo "PLATFORM_PEM=$RUNNER_TEMP/keys/platform.x509.pem" >> "$GITHUB_ENV"
+
+      - name: Build modules
+        env:
+          MODULES: ${{ inputs.modules }}
+          EXPECTED_SDK: ${{ inputs.expected_sdk }}
+          SIGN_SYSTEMUI: ${{ inputs.sign_systemui }}
+        run: ./build.sh build dump out
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: kernelsu-modules
+          path: out/*.zip
+          if-no-files-found: error
