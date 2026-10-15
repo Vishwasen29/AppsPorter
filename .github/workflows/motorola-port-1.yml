@@ -1,0 +1,348 @@
+name: Motorola UI Port Builder (Infinity-X Android 17 / OnePlus 9R)
+
+on:
+  workflow_dispatch:
+    inputs:
+      source_repo_url:
+        description: 'Git clone URL for the Motorola lhotse dump repository'
+        required: true
+        default: 'https://dumps.tadiphone.dev/dumps/motorola/lhotse.git'
+        type: string
+      source_ref:
+        description: 'Motorola Android 17 dump branch'
+        required: true
+        default: 'user-17-VWL35HV-19-ST9.2-8c0861-release-keys'
+        type: string
+      components:
+        description: 'Candidate component group to collect'
+        required: true
+        default: 'all'
+        type: choice
+        options:
+          - all
+          - launcher
+          - widgets
+          - lockscreen
+      include_wallpaper:
+        description: 'Include wallpaper and depth-effect candidates when collecting all components'
+        required: true
+        default: true
+        type: boolean
+
+permissions:
+  contents: read
+
+concurrency:
+  group: motorola-ui-port-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  build-port-candidates:
+    name: Extract, inspect and package candidates
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    env:
+      SOURCE_REPO_URL: ${{ inputs.source_repo_url }}
+      SOURCE_REF: ${{ inputs.source_ref }}
+      COMPONENTS: ${{ inputs.components }}
+      INCLUDE_WALLPAPER: ${{ inputs.include_wallpaper }}
+      TARGET_DEVICE: OnePlus 9R (lemonades / SM8250)
+      TARGET_ROM: Infinity-X Android 17
+
+    steps:
+      - name: Checkout workflow repository
+        uses: actions/checkout@v4
+
+      - name: Initialize workspace
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p work/candidates work/module work/reports
+          printf 'Target device: %s\nTarget ROM: %s\n' "$TARGET_DEVICE" "$TARGET_ROM" > work/reports/target-info.txt
+
+      - name: Set up Android SDK command-line tools
+        uses: android-actions/setup-android@v3
+
+      - name: Install supported Android SDK packages
+        shell: bash
+        run: |
+          set -euo pipefail
+          # Do not request the obsolete SDK package named "tools".
+          yes | sdkmanager --licenses >/dev/null || true
+          sdkmanager --install 'platform-tools' 'build-tools;36.0.0'
+          test -x "$ANDROID_HOME/build-tools/36.0.0/aapt"
+          "$ANDROID_HOME/build-tools/36.0.0/aapt" version
+
+      - name: Fetch Motorola dump branch
+        id: fetch
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [[ -z "$SOURCE_REPO_URL" || -z "$SOURCE_REF" ]]; then
+            echo 'ERROR: source repository URL and branch are required.' >&2
+            exit 2
+          fi
+
+          # Try the provided URL exactly first. If the host's clone endpoint omits
+          # the .git suffix, try that form as a fallback.
+          rm -rf motorola-dump
+          urls=("$SOURCE_REPO_URL")
+          if [[ "$SOURCE_REPO_URL" == *.git ]]; then
+            urls+=("${SOURCE_REPO_URL%.git}")
+          else
+            urls+=("${SOURCE_REPO_URL}.git")
+          fi
+          cloned=0
+          for url in "${urls[@]}"; do
+            echo "Trying dump clone URL: $url"
+            if git clone --depth 1 --filter=blob:none --no-checkout --branch "$SOURCE_REF" "$url" motorola-dump; then
+              SOURCE_REPO_URL="$url"
+              cloned=1
+              break
+            fi
+            rm -rf motorola-dump
+          done
+          if [[ "$cloned" -ne 1 ]]; then
+            echo 'ERROR: Could not clone the dump. Confirm the host supports Git clone and that the branch exists.' >&2
+            echo 'The URL shown in the browser may be a tree-view URL rather than a clone URL.' >&2
+            exit 1
+          fi
+
+          cd motorola-dump
+          git sparse-checkout init --cone
+          git sparse-checkout set system product system_ext vendor odm
+          git checkout "$SOURCE_REF"
+          cd "$GITHUB_WORKSPACE"
+
+          {
+            echo "Source URL: $SOURCE_REPO_URL"
+            echo "Source ref: $SOURCE_REF"
+            echo "Source commit: $(git -C motorola-dump rev-parse HEAD)"
+            echo "Target device: $TARGET_DEVICE"
+            echo "Target ROM: $TARGET_ROM"
+          } | tee work/reports/source-info.txt
+          echo "source_commit=$(git -C motorola-dump rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+
+      - name: Inventory APKs and select UI candidates
+        id: collect
+        shell: bash
+        run: |
+          set -euo pipefail
+          DUMP="$GITHUB_WORKSPACE/motorola-dump"
+          OUT="$GITHUB_WORKSPACE/work"
+          mkdir -p "$OUT/candidates" "$OUT/module" "$OUT/reports"
+
+          INVENTORY="$OUT/reports/all-apk-inventory.tsv"
+          SELECTED="$OUT/reports/selected-candidates.tsv"
+          printf 'source_path\tsize_bytes\tsha256\n' > "$INVENTORY"
+          printf 'component\tsource_path\tmodule_path\n' > "$SELECTED"
+
+          AAPT="$ANDROID_HOME/build-tools/36.0.0/aapt"
+          test -x "$AAPT"
+          printf '%s\n' "$AAPT" > "$OUT/reports/aapt-path.txt"
+
+          classify() {
+            local p="${1,,}"
+            if [[ "$p" =~ launcher|quickstep|launcher3|smartspace|moto.?home ]]; then
+              echo launcher
+            elif [[ "$p" =~ widget|weather|moto.?clock|calendar.?widget|clock.?widget ]]; then
+              echo widgets
+            elif [[ "$p" =~ keyguard|lockscreen|lock_screen|lock.?screen|motosignature|moto.?display|peekdisplay|attentive.?display|ambientdisplay|moto.?unlock ]]; then
+              echo lockscreen
+            elif [[ "$INCLUDE_WALLPAPER" == 'true' && "$p" =~ wallpaper|live.?wallpaper|depth.?effect ]]; then
+              echo wallpaper
+            else
+              echo ''
+            fi
+          }
+
+          count_all=0; count_selected=0; count_launcher=0; count_widgets=0; count_lockscreen=0; count_wallpaper=0
+          search_roots=()
+          for part in system product system_ext vendor odm; do
+            [[ -d "$DUMP/$part" ]] && search_roots+=("$DUMP/$part")
+          done
+          if [[ ${#search_roots[@]} -eq 0 ]]; then
+            echo 'ERROR: Expected Android partition directories were not found in the checked-out dump.' >&2
+            find "$DUMP" -maxdepth 3 -type d | head -100 || true
+            exit 1
+          fi
+
+          while IFS= read -r -d '' apk; do
+            rel="${apk#"$DUMP"/}"
+            size="$(stat -c '%s' "$apk")"
+            hash="$(sha256sum "$apk" | awk '{print $1}')"
+            printf '%s\t%s\t%s\n' "$rel" "$size" "$hash" >> "$INVENTORY"
+            count_all=$((count_all + 1))
+
+            category="$(classify "$rel")"
+            [[ -n "$category" ]] || continue
+            if [[ "$COMPONENTS" != 'all' && "$COMPONENTS" != "$category" ]]; then
+              continue
+            fi
+            [[ "$category" != wallpaper || ( "$COMPONENTS" == 'all' && "$INCLUDE_WALLPAPER" == 'true' ) ]] || continue
+
+            mkdir -p "$OUT/candidates/$(dirname "$rel")"
+            cp -p "$apk" "$OUT/candidates/$rel"
+
+            # Magisk/KernelSU module overlay convention: partition paths are
+            # represented under module/system/ (e.g. system/product/priv-app/...).
+            case "$rel" in
+              system/*)     module_rel="$rel" ;;
+              product/*)    module_rel="system/$rel" ;;
+              system_ext/*) module_rel="system/$rel" ;;
+              vendor/*)     module_rel="system/$rel" ;;
+              odm/*)        module_rel="system/$rel" ;;
+              *)            continue ;;
+            esac
+            mkdir -p "$OUT/module/$(dirname "$module_rel")"
+            cp -p "$apk" "$OUT/module/$module_rel"
+            printf '%s\t%s\t%s\n' "$category" "$rel" "$module_rel" >> "$SELECTED"
+            count_selected=$((count_selected + 1))
+            case "$category" in
+              launcher) count_launcher=$((count_launcher + 1)) ;;
+              widgets) count_widgets=$((count_widgets + 1)) ;;
+              lockscreen) count_lockscreen=$((count_lockscreen + 1)) ;;
+              wallpaper) count_wallpaper=$((count_wallpaper + 1)) ;;
+            esac
+          done < <(find "${search_roots[@]}" -type f -iname '*.apk' -print0)
+
+          {
+            echo "All APKs inventoried: $count_all"
+            echo "Selected APK candidates: $count_selected"
+            echo "Launcher candidates: $count_launcher"
+            echo "Widget/weather/clock candidates: $count_widgets"
+            echo "Lockscreen/Keyguard/Moto Display candidates: $count_lockscreen"
+            echo "Wallpaper/depth-effect candidates: $count_wallpaper"
+            echo
+            echo 'Selection is heuristic based on source paths and filenames. It does not prove functionality, completeness, or compatibility.'
+          } > "$OUT/reports/summary.txt"
+
+          {
+            echo "all_apks=$count_all"
+            echo "selected=$count_selected"
+            echo "launcher=$count_launcher"
+            echo "widgets=$count_widgets"
+            echo "lockscreen=$count_lockscreen"
+            echo "wallpaper=$count_wallpaper"
+          } >> "$GITHUB_OUTPUT"
+
+          echo "Inventoried $count_all APKs; selected $count_selected candidates."
+
+      - name: Extract APK manifest metadata
+        if: always()
+        shell: bash
+        run: |
+          set -uo pipefail
+          OUT="$GITHUB_WORKSPACE/work"
+          mkdir -p "$OUT/reports" "$OUT/candidates"
+          REPORT="$OUT/reports/candidate-manifest-metadata.txt"
+          AAPT="$ANDROID_HOME/build-tools/36.0.0/aapt"
+          : > "$REPORT"
+
+          if [[ ! -x "$AAPT" ]]; then
+            echo 'aapt unavailable; manifest metadata could not be generated.' > "$REPORT"
+            exit 0
+          fi
+
+          found=0
+          while IFS= read -r -d '' apk; do
+            found=1
+            rel="${apk#"$OUT/candidates"/}"
+            {
+              echo '============================================================'
+              echo "Candidate path: $rel"
+              "$AAPT" dump badging "$apk" 2>&1 \
+                | grep -E '^(package:|sdkVersion:|targetSdkVersion:|launchable-activity:|uses-permission:|uses-library:|uses-feature:|native-code:)' || true
+              echo
+            } >> "$REPORT"
+          done < <(find "$OUT/candidates" -type f -iname '*.apk' -print0 2>/dev/null)
+          if [[ "$found" -eq 0 ]]; then
+            echo 'No APK candidates were available for metadata inspection.' >> "$REPORT"
+          fi
+
+      - name: Write experimental module metadata and porting notes
+        if: always()
+        shell: bash
+        run: |
+          set -euo pipefail
+          MODULE="$GITHUB_WORKSPACE/work/module"
+          REPORTS="$GITHUB_WORKSPACE/work/reports"
+          mkdir -p "$MODULE" "$REPORTS"
+          if [[ -s "$REPORTS/selected-candidates.tsv" ]] && [[ "$(wc -l < "$REPORTS/selected-candidates.tsv")" -gt 1 ]]; then
+            version_code="$GITHUB_RUN_NUMBER"
+            cat > "$MODULE/module.prop" <<EOF2
+          id=motorola_ui_candidates_infinityx
+          name=Motorola UI Candidates (Infinity-X Android 17)
+          version=0.1.${version_code}
+          versionCode=${version_code}
+          author=Community porting workflow
+          description=Experimental Motorola UI APK candidates for OnePlus 9R lemonades
+          EOF2
+          fi
+          cat > "$MODULE/PORTING_STATUS.txt" <<EOF2
+          EXPERIMENTAL CANDIDATE PACKAGE - NOT A VERIFIED PORT
+          Target ROM: ${TARGET_ROM}
+          Target device: ${TARGET_DEVICE}
+          Source branch: ${SOURCE_REF}
+
+          The APKs are selected by path/name heuristics from the Motorola dump.
+          This workflow does not patch Android framework-res, SystemUI, PackageManager,
+          privapp-permissions allowlists, overlays, signatures, hidden APIs, or proprietary
+          Motorola services. A lockscreen APK alone is not a complete lockscreen port.
+
+          The module ZIP is for inspection and controlled testing only. Do not flash on a
+          daily-driver installation without a full backup and a recovery path. APK overlays
+          can conflict with existing system packages and may cause boot or SystemUI failures.
+          EOF2
+          if [[ -f "$REPORTS/selected-candidates.tsv" ]]; then
+            cp "$REPORTS/selected-candidates.tsv" "$MODULE/SELECTED-CANDIDATES.tsv"
+          fi
+
+      - name: Create candidate, module and report ZIPs
+        if: always()
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd "$GITHUB_WORKSPACE/work"
+          rm -f motorola-ui-candidates.zip motorola-ui-candidate-module.zip motorola-port-reports.zip
+          if find candidates -type f -iname '*.apk' -print -quit | grep -q .; then
+            zip -qr motorola-ui-candidates.zip candidates
+          fi
+          if [[ -f module/module.prop ]] && find module -type f -iname '*.apk' -print -quit | grep -q .; then
+            (cd module && zip -qr ../motorola-ui-candidate-module.zip .)
+          fi
+          zip -qr motorola-port-reports.zip reports
+
+      - name: Upload candidate APKs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: motorola-ui-apk-candidates
+          path: work/motorola-ui-candidates.zip
+          if-no-files-found: ignore
+          retention-days: 14
+
+      - name: Upload experimental KernelSU/Magisk module
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: motorola-ui-candidate-module-infinityx-android17-lemonades
+          path: work/motorola-ui-candidate-module.zip
+          if-no-files-found: ignore
+          retention-days: 14
+
+      - name: Upload porting reports
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: motorola-ui-port-reports
+          path: work/motorola-port-reports.zip
+          if-no-files-found: error
+          retention-days: 14
+
+      - name: Fail if no candidates were found
+        if: always() && steps.collect.outputs.selected == '0'
+        shell: bash
+        run: |
+          echo 'No UI candidates were selected. Review the source-fetch logs and work/reports/all-apk-inventory.tsv.'
+          exit 1
